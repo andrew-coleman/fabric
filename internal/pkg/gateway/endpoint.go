@@ -35,8 +35,8 @@ type endpointConfig struct {
 }
 
 type (
-	endorserConnector func(*grpc.ClientConn) peer.EndorserClient
-	ordererConnector  func(*grpc.ClientConn) ab.AtomicBroadcastClient
+	endorserConnector func(grpc.ClientConnInterface) peer.EndorserClient
+	ordererConnector  func(grpc.ClientConnInterface) ab.AtomicBroadcastClient
 )
 
 //go:generate counterfeiter -o mocks/dialer.go --fake-name Dialer . dialer
@@ -79,7 +79,7 @@ func (ef *endpointFactory) newOrderer(address, mspid string, tlsRootCerts [][]by
 	}, nil
 }
 
-func (ef *endpointFactory) newConnection(address string, tlsRootCerts [][]byte) (*grpc.ClientConn, error) {
+func (ef *endpointFactory) newConnection(address string, tlsRootCerts [][]byte) (grpc.ClientConnInterface, error) {
 	config := comm.ClientConfig{
 		SecOpts: comm.SecureOptions{
 			UseTLS:            len(tlsRootCerts) > 0,

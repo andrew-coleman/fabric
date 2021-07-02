@@ -14,6 +14,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 
+	"github.com/golang/protobuf/proto"
 	cb "github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
 	mspproto "github.com/hyperledger/fabric-protos-go/msp"
@@ -23,10 +24,8 @@ import (
 	"github.com/hyperledger/fabric/core/endorser"
 	"github.com/hyperledger/fabric/core/endorser/fake"
 	"github.com/hyperledger/fabric/core/ledger"
-	"github.com/hyperledger/fabric/protoutil"
-
-	"github.com/golang/protobuf/proto"
 	ledgermock "github.com/hyperledger/fabric/core/ledger/mock"
+	"github.com/hyperledger/fabric/protoutil"
 )
 
 var _ = Describe("Endorser", func() {

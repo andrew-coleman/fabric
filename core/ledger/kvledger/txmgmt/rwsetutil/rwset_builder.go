@@ -58,6 +58,7 @@ type nsPvtRwBuilder struct {
 
 type collPvtRwBuilder struct {
 	collectionName   string
+	readMap          map[string]*kvrwset.KVRead
 	writeMap         map[string]*kvrwset.KVWrite
 	metadataWriteMap map[string]*kvrwset.KVMetadataWrite
 }
@@ -101,6 +102,12 @@ func (b *RWSetBuilder) AddToRangeQuerySet(ns string, rqi *kvrwset.RangeQueryInfo
 		nsPubRwBuilder.rangeQueriesMap[key] = rqi
 		nsPubRwBuilder.rangeQueriesKeys = append(nsPubRwBuilder.rangeQueriesKeys, key)
 	}
+}
+
+// AddToPvtReadSet adds a key and corresponding version to the private read-set
+func (b *RWSetBuilder) AddToPvtReadSet(ns string, coll string, key string, version *version.Height) {
+	kvRead := NewKVRead(key, version)
+	b.getOrCreateCollPvtRwBuilder(ns, coll).readMap[key] = kvRead
 }
 
 // AddToHashedReadSet adds a key and corresponding version to the hashed read-set
@@ -257,13 +264,16 @@ func (b *collHashRwBuilder) build() *CollHashedRwSet {
 }
 
 func (b *collPvtRwBuilder) build() *CollPvtRwSet {
+	var readSet []*kvrwset.KVRead
 	var writeSet []*kvrwset.KVWrite
 	var metadataWriteSet []*kvrwset.KVMetadataWrite
+	util.GetValuesBySortedKeys(&(b.readMap), &readSet)
 	util.GetValuesBySortedKeys(&(b.writeMap), &writeSet)
 	util.GetValuesBySortedKeys(&(b.metadataWriteMap), &metadataWriteSet)
 	return &CollPvtRwSet{
 		CollectionName: b.collectionName,
 		KvRwSet: &kvrwset.KVRWSet{
+			Reads:          readSet,
 			Writes:         writeSet,
 			MetadataWrites: metadataWriteSet,
 		},
@@ -337,6 +347,7 @@ func newCollHashRwBuilder(collName string) *collHashRwBuilder {
 func newCollPvtRwBuilder(collName string) *collPvtRwBuilder {
 	return &collPvtRwBuilder{
 		collName,
+		make(map[string]*kvrwset.KVRead),
 		make(map[string]*kvrwset.KVWrite),
 		make(map[string]*kvrwset.KVMetadataWrite),
 	}

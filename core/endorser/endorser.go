@@ -14,6 +14,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-chaincode-go/shim"
+	"github.com/hyperledger/fabric-protos-go/discovery"
 	pb "github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric-protos-go/transientstore"
 	"github.com/hyperledger/fabric/common/flogging"
@@ -173,8 +174,8 @@ func (e *Endorser) callChaincode(txParams *ccprovider.TransactionParams, input *
 	return res, ccevent, err
 }
 
-// SimulateProposal simulates the proposal by calling the chaincode
-func (e *Endorser) SimulateProposal(txParams *ccprovider.TransactionParams, chaincodeName string, chaincodeInput *pb.ChaincodeInput) (*pb.Response, []byte, *pb.ChaincodeEvent, error) {
+// simulateProposal simulates the proposal by calling the chaincode
+func (e *Endorser) simulateProposal(txParams *ccprovider.TransactionParams, chaincodeName string, chaincodeInput *pb.ChaincodeInput) (*pb.Response, []byte, *pb.ChaincodeEvent, []byte, [][]byte, error) {
 	logger := decorateLogger(endorserLogger, txParams)
 
 	meterLabels := []string{
@@ -186,11 +187,11 @@ func (e *Endorser) SimulateProposal(txParams *ccprovider.TransactionParams, chai
 	res, ccevent, err := e.callChaincode(txParams, chaincodeInput, chaincodeName)
 	if err != nil {
 		logger.Errorf("failed to invoke chaincode %s, error: %+v", chaincodeName, err)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	if txParams.TXSimulator == nil {
-		return res, nil, ccevent, nil
+		return res, nil, ccevent, nil, nil, nil
 	}
 
 	// Note, this is a little goofy, as if there is private data, Done() gets called
@@ -201,14 +202,14 @@ func (e *Endorser) SimulateProposal(txParams *ccprovider.TransactionParams, chai
 	simResult, err := txParams.TXSimulator.GetTxSimulationResults()
 	if err != nil {
 		e.Metrics.SimulationFailure.With(meterLabels...).Add(1)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	if simResult.PvtSimulationResults != nil {
 		if chaincodeName == "lscc" {
 			// TODO: remove once we can store collection configuration outside of LSCC
 			e.Metrics.SimulationFailure.With(meterLabels...).Add(1)
-			return nil, nil, nil, errors.New("Private data is forbidden to be used in instantiate")
+			return nil, nil, nil, nil, nil, errors.New("Private data is forbidden to be used in instantiate")
 		}
 		pvtDataWithConfig, err := AssemblePvtRWSet(txParams.ChannelID, simResult.PvtSimulationResults, txParams.TXSimulator, e.Support.GetDeployedCCInfoProvider())
 		// To read collection config need to read collection updates before
@@ -217,12 +218,12 @@ func (e *Endorser) SimulateProposal(txParams *ccprovider.TransactionParams, chai
 
 		if err != nil {
 			e.Metrics.SimulationFailure.With(meterLabels...).Add(1)
-			return nil, nil, nil, errors.WithMessage(err, "failed to obtain collections config")
+			return nil, nil, nil, nil, nil, errors.WithMessage(err, "failed to obtain collections config")
 		}
 		endorsedAt, err := e.Support.GetLedgerHeight(txParams.ChannelID)
 		if err != nil {
 			e.Metrics.SimulationFailure.With(meterLabels...).Add(1)
-			return nil, nil, nil, errors.WithMessage(err, fmt.Sprintf("failed to obtain ledger height for channel '%s'", txParams.ChannelID))
+			return nil, nil, nil, nil, nil, errors.WithMessage(err, fmt.Sprintf("failed to obtain ledger height for channel '%s'", txParams.ChannelID))
 		}
 		// Add ledger height at which transaction was endorsed,
 		// `endorsedAt` is obtained from the block storage and at times this could be 'endorsement Height + 1'.
@@ -232,17 +233,23 @@ func (e *Endorser) SimulateProposal(txParams *ccprovider.TransactionParams, chai
 		pvtDataWithConfig.EndorsedAt = endorsedAt
 		if err := e.PrivateDataDistributor.DistributePrivateData(txParams.ChannelID, txParams.TxID, pvtDataWithConfig, endorsedAt); err != nil {
 			e.Metrics.SimulationFailure.With(meterLabels...).Add(1)
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
+
+	}
+
+	ccInterestBytes, err := buildChaincodeInterest(simResult)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
 	}
 
 	pubSimResBytes, err := simResult.GetPubSimulationBytes()
 	if err != nil {
 		e.Metrics.SimulationFailure.With(meterLabels...).Add(1)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
-	return res, pubSimResBytes, ccevent, nil
+	return res, pubSimResBytes, ccevent, ccInterestBytes, simResult.KeySignaturePolicies, nil
 }
 
 // preProcess checks the tx proposal headers, uniqueness and ACL
@@ -394,7 +401,7 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 	}
 
 	// 1 -- simulate
-	res, simulationResult, ccevent, err := e.SimulateProposal(txParams, up.ChaincodeName, up.Input)
+	res, simulationResult, ccevent, interest, keySignaturePolicies, err := e.simulateProposal(txParams, up.ChaincodeName, up.Input)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error in simulation")
 	}
@@ -422,8 +429,10 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 	switch {
 	case res.Status >= shim.ERROR:
 		return &pb.ProposalResponse{
-			Response: res,
-			Payload:  prpBytes,
+			Response:    res,
+			Payload:     prpBytes,
+			Interest:    interest,
+			KeyPolicies: keySignaturePolicies,
 		}, nil
 	case up.ChannelID() == "":
 		// Chaincode invocations without a channel ID is a broken concept
@@ -458,6 +467,8 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 		Endorsement: endorsement,
 		Payload:     mPrpBytes,
 		Response:    res,
+		Interest:    interest,
+		KeyPolicies: keySignaturePolicies,
 	}, nil
 }
 
@@ -499,4 +510,44 @@ func CreateCCEventBytes(ccevent *pb.ChaincodeEvent) ([]byte, error) {
 
 func decorateLogger(logger *flogging.FabricLogger, txParams *ccprovider.TransactionParams) *flogging.FabricLogger {
 	return logger.With("channel", txParams.ChannelID, "txID", shorttxid(txParams.TxID))
+}
+
+// Using the simulation results, build the ChaincodeInterest structure that the client can pass to the discovery service
+// to get the correct endorsement policy for the chaincode(s) and any collections encountered.
+func buildChaincodeInterest(simResult *ledger.TxSimulationResults) ([]byte, error) {
+	ccInterest := &discovery.ChaincodeInterest{}
+
+	chaincodes := map[string]struct{}{}
+	if simResult.PvtSimulationResults != nil {
+		// prototype - list collections that are read from (in order to populate NoPublicReads in ChaincodeInterest)
+		for _, prws := range simResult.PvtSimulationResults.GetNsPvtRwset() {
+			for _, cprws := range prws.GetCollectionPvtRwset() {
+				kvrwset, err := protoutil.UnmarshalKVRWSet(cprws.GetRwset())
+				if err != nil {
+					return nil, err
+				}
+				ccInterest.Chaincodes = append(ccInterest.Chaincodes, &discovery.ChaincodeCall{
+					Name:            prws.GetNamespace(),
+					CollectionNames: []string{cprws.GetCollectionName()},
+					NoPrivateReads:  len(kvrwset.GetReads()) == 0,
+				})
+				chaincodes[prws.GetNamespace()] = struct{}{}
+			}
+		}
+	}
+	// if there are any chaincodes in the public RWset that are not in the private set, add them to the interest
+	if simResult.PubSimulationResults != nil {
+		for _, nsrws := range simResult.PubSimulationResults.GetNsRwset() {
+			if nsrws.GetNamespace() == "_lifecycle" {
+				continue
+			}
+			if _, ok := chaincodes[nsrws.GetNamespace()]; !ok {
+				ccInterest.Chaincodes = append(ccInterest.Chaincodes, &discovery.ChaincodeCall{
+					Name: nsrws.GetNamespace(),
+				})
+				chaincodes[nsrws.GetNamespace()] = struct{}{}
+			}
+		}
+	}
+	return proto.Marshal(ccInterest)
 }

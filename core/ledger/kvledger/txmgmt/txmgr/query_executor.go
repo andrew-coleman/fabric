@@ -219,6 +219,7 @@ func (q *queryExecutor) GetPrivateData(ns, coll, key string) ([]byte, error) {
 	}
 	if q.collectReadset {
 		q.rwsetBuilder.AddToHashedReadSet(ns, coll, key, ver)
+		q.rwsetBuilder.AddToPvtReadSet(ns, coll, key, ver)
 	}
 	return val, nil
 }

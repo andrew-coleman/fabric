@@ -13,6 +13,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-protos-go/common"
+	dp "github.com/hyperledger/fabric-protos-go/discovery"
 	gp "github.com/hyperledger/fabric-protos-go/gateway"
 	"github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric/core/aclmgmt/resources"
@@ -32,9 +33,14 @@ func (gs *Server) Evaluate(ctx context.Context, request *gp.EvaluateRequest) (*g
 		return nil, status.Error(codes.InvalidArgument, "an evaluate request is required")
 	}
 	signedProposal := request.GetProposedTransaction()
-	channel, chaincodeID, err := getChannelAndChaincodeFromSignedProposal(signedProposal)
+	channel, chaincodeID, _, err := getChannelAndChaincodeFromSignedProposal(signedProposal)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to unpack transaction proposal: %s", err)
+	}
+
+	err = gs.registry.registerChannel(channel)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "%s", err)
 	}
 
 	endorser, err := gs.registry.evaluator(channel, chaincodeID, request.GetTargetOrganizations())
@@ -68,7 +74,7 @@ func (gs *Server) Evaluate(ctx context.Context, request *gp.EvaluateRequest) (*g
 		Result: retVal,
 	}
 
-	logger.Debugw("Evaluate call to endorser returned success", "channel", request.ChannelId, "txid", request.TransactionId, "endorserAddress", endorser.endpointConfig.address, "endorserMspid", endorser.endpointConfig.mspid, "status", retVal.Status, "message", retVal.Message)
+	logger.Debugw("Evaluate call to endorser returned success", "channel", request.ChannelId, "txid", request.TransactionId, "endorserAddress", endorser.endpointConfig.address, "endorserMspid", endorser.endpointConfig.mspid, "status", retVal.GetStatus(), "message", retVal.GetMessage())
 	return evaluateResponse, nil
 }
 
@@ -86,23 +92,97 @@ func (gs *Server) Endorse(ctx context.Context, request *gp.EndorseRequest) (*gp.
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to unpack transaction proposal: %s", err)
 	}
-	channel, chaincodeID, err := getChannelAndChaincodeFromSignedProposal(signedProposal)
+	channel, chaincodeID, hasTransientData, err := getChannelAndChaincodeFromSignedProposal(signedProposal)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to unpack transaction proposal: %s", err)
 	}
 
-	var endorsers []*endorser
-	if len(request.EndorsingOrganizations) > 0 {
-		endorsers, err = gs.registry.endorsersForOrgs(channel, chaincodeID, request.EndorsingOrganizations)
-	} else {
-		endorsers, err = gs.registry.endorsers(channel, chaincodeID)
-	}
+	err = gs.registry.registerChannel(channel)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "%s", err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, gs.options.EndorsementTimeout)
 	defer cancel()
+
+	var endorsers []*endorser
+	var responses []*peer.ProposalResponse
+	if len(request.EndorsingOrganizations) > 0 {
+		// The client is specifying the endorsing orgs and taking responsibility for ensuring it meets the signature policy
+		endorsers, err = gs.registry.endorsersForOrgs(channel, chaincodeID, request.EndorsingOrganizations)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "%s", err)
+		}
+	} else {
+		// The client is delegating choice of endorsers to the gateway.
+
+		// 1. Choose an endorser from the gateway's organization
+		var firstEndorser *endorser
+		es, ok := gs.registry.endorsersByOrg(channel, chaincodeID)[gs.registry.localEndorser.mspid]
+		if !ok {
+			// No local org endorsers for this channel/chaincode. If transient data is involved, return error
+			if hasTransientData {
+				return nil, status.Error(codes.FailedPrecondition, "no endorsers found in the gateway's organization; retry specifying endorsing organization(s) to protect transient data")
+			}
+			// Otherwise, just let discovery pick one.
+			endorsers, err = gs.registry.endorsers(channel, chaincodeID)
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "%s", err)
+			}
+			firstEndorser = endorsers[0]
+		} else {
+			firstEndorser = es[0].endorser
+		}
+
+		// 2. Process the proposal on this endorser
+		firstResponse, err := firstEndorser.client.ProcessProposal(ctx, signedProposal)
+		if err != nil {
+			return nil, rpcError(codes.Aborted, "failed to endorse transaction", endpointError(firstEndorser, err))
+		}
+		if firstResponse.Response.Status < 200 || firstResponse.Response.Status >= 400 {
+			return nil, rpcError(codes.Aborted, "failed to endorse transaction", endpointError(firstEndorser, fmt.Errorf("error %d, %s", firstResponse.Response.Status, firstResponse.Response.Message)))
+		}
+
+		// 3. Extract ChaincodeInterest and SBE policies
+		// The chaincode interest could be nil for legacy peers and for chaincode functions that don't produce a read-write set
+		cci := &dp.ChaincodeInterest{}
+		if len(firstResponse.Interest) == 0 {
+			cci.Chaincodes = []*dp.ChaincodeCall{{Name: chaincodeID}}
+		} else {
+			err = proto.Unmarshal(firstResponse.Interest, cci)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to unpack chaincode interest: %s", err)
+			}
+		}
+
+		var keyPolicies []*common.SignaturePolicyEnvelope
+		for _, sigBytes := range firstResponse.KeyPolicies {
+			sp, err := protoutil.UnmarshalSignaturePolicy(sigBytes)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to unpack key signature policy: %s", err)
+			}
+			keyPolicies = append(keyPolicies, sp)
+		}
+
+		endorsers, err = gs.registry.endorsersWithInterest(channel, cci, keyPolicies)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "%s", err)
+		}
+
+		// 4. Remove the gateway org's endorser, since we've already done that
+		for i, e := range endorsers {
+			if e.mspid == firstEndorser.mspid {
+				endorsers = append(endorsers[:i], endorsers[i+1:]...)
+				responses = append(responses, firstResponse)
+				break
+			}
+		}
+
+		// 5. If transient data is involved, and other (non-local) orgs are required to endorse, return error for privacy reasons
+		if hasTransientData && len(endorsers) > 0 {
+			return nil, status.Error(codes.FailedPrecondition, "non-local organizations are required to endorse; retry specifying endorsing organization(s) to protect transient data")
+		}
+	}
 
 	var wg sync.WaitGroup
 	responseCh := make(chan *endorserResponse, len(endorsers))
@@ -129,7 +209,6 @@ func (gs *Server) Endorse(ctx context.Context, request *gp.EndorseRequest) (*gp.
 	wg.Wait()
 	close(responseCh)
 
-	var responses []*peer.ProposalResponse
 	var errorDetails []proto.Message
 	for response := range responseCh {
 		if response.err != nil {

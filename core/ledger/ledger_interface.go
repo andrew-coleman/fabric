@@ -474,6 +474,7 @@ func (filter PvtNsCollFilter) Has(ns string, coll string) bool {
 type TxSimulationResults struct {
 	PubSimulationResults *rwset.TxReadWriteSet
 	PvtSimulationResults *rwset.TxPvtReadWriteSet
+	KeySignaturePolicies [][]byte
 }
 
 // GetPubSimulationBytes returns the serialized bytes of public readwrite set
