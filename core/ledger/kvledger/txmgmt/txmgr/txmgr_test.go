@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hyperledger/fabric-protos-go/peer"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-protos-go/ledger/queryresult"
 	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
@@ -88,6 +90,10 @@ func TestTxSimulatorGetResults(t *testing.T) {
 	simulationResults1, err := simulator.GetTxSimulationResults()
 	require.NoError(t, err)
 	require.Len(t, simulationResults1.PubSimulationResults.NsRwset, 1)
+	// verify the Private Read has been captured
+	expectedPrivateReads := &ledger.PrivateReads{}
+	expectedPrivateReads.Add("ns1", "coll1")
+	require.Equal(t, expectedPrivateReads, simulationResults1.PrivateReads)
 	// clone freeze simulationResults1
 	buff1 := new(bytes.Buffer)
 	require.NoError(t, gob.NewEncoder(buff1).Encode(simulationResults1))
@@ -1591,4 +1597,62 @@ func TestName(t *testing.T) {
 	defer testEnv.cleanup()
 	txMgr := testEnv.getTxMgr()
 	require.Equal(t, "state", txMgr.Name())
+}
+
+func TestTxSimulatorWithStateBasedEndorsement(t *testing.T) {
+	for _, testEnv := range testEnvs {
+		t.Run(testEnv.getName(), func(t *testing.T) {
+			testLedgerID := "testtxsimulatorwithdtstebasedendorsement"
+			testEnv.init(t, testLedgerID, nil)
+			testTxSimulatorWithStateBasedEndorsement(t, testEnv)
+			testEnv.cleanup()
+		})
+	}
+}
+
+func testTxSimulatorWithStateBasedEndorsement(t *testing.T, env testEnv) {
+	txMgr := env.getTxMgr()
+	txMgrHelper := newTxMgrTestHelper(t, txMgr)
+	sbe1 := []byte("SBE1")
+	sbe2 := []byte("SBE2")
+	// simulate tx1
+	s1, _ := txMgr.NewTxSimulator("test_tx1")
+	require.NoError(t, s1.SetState("ns1", "key1", []byte("value1")))
+	require.NoError(t, s1.SetState("ns1", "key2", []byte("value2")))
+	require.NoError(t, s1.SetStateMetadata("ns1", "key2", map[string][]byte{peer.MetaDataKeys_VALIDATION_PARAMETER.String(): sbe1}))
+	require.NoError(t, s1.SetState("ns2", "key3", []byte("value3")))
+	require.NoError(t, s1.SetStateMetadata("ns2", "key3", map[string][]byte{peer.MetaDataKeys_VALIDATION_PARAMETER.String(): sbe2}))
+	require.NoError(t, s1.SetState("ns2", "key4", []byte("value4")))
+	s1.Done()
+	// validate and commit RWset
+	txRWSet1, _ := s1.GetTxSimulationResults()
+	txMgrHelper.validateAndCommitRWSet(txRWSet1.PubSimulationResults)
+
+	// simulate tx2 that make changes to existing data and updates a key policy
+	s2, _ := txMgr.NewTxSimulator("test_tx2")
+	sbe3 := []byte("SBE3")
+	require.NoError(t, s2.SetState("ns1", "key1", []byte("value1b")))
+	require.NoError(t, s2.SetState("ns1", "key2", []byte("value2b")))
+	require.NoError(t, s2.SetStateMetadata("ns2", "key3", map[string][]byte{peer.MetaDataKeys_VALIDATION_PARAMETER.String(): sbe3}))
+	require.NoError(t, s2.SetState("ns2", "key4", []byte("value4b")))
+	s2.Done()
+	// validate and commit RWset for tx2
+	txRWSet2, err := s2.GetTxSimulationResults()
+	require.NoError(t, err)
+	txMgrHelper.validateAndCommitRWSet(txRWSet2.PubSimulationResults)
+	// check the SBE policies are captured
+	require.ElementsMatch(t, [][]byte{sbe1, sbe2}, txRWSet2.KeySignaturePolicies)
+
+	// simulate tx3
+	s3, _ := txMgr.NewTxSimulator("test_tx3")
+	require.NoError(t, s3.SetState("ns1", "key1", []byte("value1c")))
+	require.NoError(t, s3.SetState("ns1", "key2", []byte("value2c")))
+	require.NoError(t, s3.SetState("ns2", "key3", []byte("value3c")))
+	require.NoError(t, s3.SetState("ns2", "key4", []byte("value4c")))
+	s3.Done()
+
+	// check the updated SBE policies are captured
+	txRWSet3, err := s3.GetTxSimulationResults()
+	require.NoError(t, err)
+	require.ElementsMatch(t, [][]byte{sbe1, sbe3}, txRWSet3.KeySignaturePolicies)
 }
